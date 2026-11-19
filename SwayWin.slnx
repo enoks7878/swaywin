@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="src/SwayWin.Core/SwayWin.Core.csproj" />
+  <Project Path="src/SwayWin.App/SwayWin.App.csproj" />
+  <Project Path="tests/SwayWin.Tests/SwayWin.Tests.csproj" />
+</Solution>
