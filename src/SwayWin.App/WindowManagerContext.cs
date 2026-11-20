@@ -69,6 +69,10 @@ internal sealed class WindowManagerContext : ApplicationContext, IInputHost
     private uint focusIntentTime;
     private bool hasFocusIntent;
     private Native.Point previousPointer;
+    private readonly System.Windows.Forms.Timer focusTimer = new() { Interval = 40 };
+    private nint focusTarget;
+    private long focusDeadline;
+    private long foregroundSyncBlockedUntil;
 
     internal WindowManagerContext(SwayConfig config, AppOptions options)
     {
@@ -91,6 +95,7 @@ internal sealed class WindowManagerContext : ApplicationContext, IInputHost
         tray.DoubleClick += (_, _) => desktop.TryExecute("swaywin-launcher");
         maintenance.Tick += (_, _) => Reconcile();
         hover.Tick += (_, _) => PointerFocus();
+        focusTimer.Tick += (_, _) => RetryFocus();
         layoutTimer.Tick += (_, _) =>
         {
             layoutTimer.Stop();
@@ -195,6 +200,12 @@ internal sealed class WindowManagerContext : ApplicationContext, IInputHost
         if (type == Native.EventSystemForeground)
         {
             if (Native.GetForegroundWindow() != hwnd || !Native.IsWindowVisible(hwnd) || window.Hidden) return;
+            // Windows hands activation to another window while the previous workspace is being hidden.
+            // That is not a request to leave the workspace the user just selected.
+            if (Environment.TickCount64 < foregroundSyncBlockedUntil &&
+                state.Windows.TryGetValue(hwnd.ToInt64(), out WindowNode? node) &&
+                state.WorkspaceOf(node) is { } workspace && workspace != state.CurrentWorkspace)
+            { ScheduleLayout(); return; }
             state.FocusWindow(hwnd.ToInt64());
             ScheduleLayout();
         }
@@ -391,7 +402,11 @@ internal sealed class WindowManagerContext : ApplicationContext, IInputHost
         RetryPendingRecovery();
         EnumerateExisting();
         nint foreground = Native.GetForegroundWindow();
-        if (managed.ContainsKey(foreground) && state.FocusedWindow?.WindowId != foreground.ToInt64())
+        // A hidden window can stay the reported foreground window after its workspace was left.
+        // Following it here would silently undo a workspace switch on the next maintenance tick.
+        if (Environment.TickCount64 >= foregroundSyncBlockedUntil &&
+            managed.TryGetValue(foreground, out ManagedWindow? foregroundWindow) && !foregroundWindow.Hidden &&
+            state.FocusedWindow?.WindowId != foreground.ToInt64())
         { state.FocusWindow(foreground.ToInt64()); ScheduleLayout(); }
         foreach (WorkspaceBar bar in bars.Values) bar.Invalidate();
     }
@@ -449,6 +464,7 @@ internal sealed class WindowManagerContext : ApplicationContext, IInputHost
             nint foreground = Native.GetForegroundWindow();
             bool showDecorations = managed.ContainsKey(foreground) || Native.GetProcessId(foreground) == Environment.ProcessId;
             HashSet<long> visibleBorders = [];
+            bool focusPending = false;
             foreach (WindowLayout layout in snapshot.Windows)
             {
                 nint hwnd = (nint)layout.WindowId;
@@ -534,6 +550,13 @@ internal sealed class WindowManagerContext : ApplicationContext, IInputHost
                     border.UpdateBorder(ToRectangle(layout.Bounds), layout.BorderWidth, active);
                     border.Visible = showDecorations;
                 }
+                if (focus && selectedWindow && layout.Visible) focusPending = true;
+            }
+            if (focus)
+            {
+                // Focus changes triggered by hiding the old workspace must not rewrite the selection.
+                foregroundSyncBlockedUntil = Math.Max(foregroundSyncBlockedUntil, Environment.TickCount64 + 500);
+                if (focusPending && state.FocusedWindow is { } focusedWindow) BeginFocusWatch((nint)focusedWindow.WindowId);
             }
             foreach ((long id, DecorationForm border) in borders) if (!visibleBorders.Contains(id)) border.Hide();
             HashSet<long> visibleHeaders = [];
@@ -554,6 +577,34 @@ internal sealed class WindowManagerContext : ApplicationContext, IInputHost
             foreach (WorkspaceBar bar in bars.Values) bar.Invalidate();
         }
         finally { applying = false; }
+    }
+
+    private void BeginFocusWatch(nint hwnd)
+    {
+        if (hwnd == 0 || stopping || paused) return;
+        focusTarget = hwnd;
+        focusDeadline = Environment.TickCount64 + 600;
+        if (!focusTimer.Enabled) focusTimer.Start();
+    }
+
+    private void RetryFocus()
+    {
+        focusTimer.Stop();
+        nint target = focusTarget;
+        if (target == 0 || stopping || paused || desktop.IsOverlayOpen) return;
+        if (!managed.TryGetValue(target, out ManagedWindow? record) || record.Hidden || !Native.IsWindowVisible(target))
+        { focusTarget = 0; return; }
+        nint current = Native.GetForegroundWindow();
+        if (current == target) { focusTarget = 0; return; }
+        // Retry only while an empty desktop, the shell surface or the stale hidden window owns focus.
+        // Any real application the user switched to keeps its focus.
+        bool stale = current == 0 || managed.TryGetValue(current, out ManagedWindow? currentRecord) && currentRecord.Hidden;
+        if (!stale && !ShellClasses.Contains(Native.GetClass(current))) { focusTarget = 0; return; }
+        Native.FocusWindow(target);
+        if (Native.GetForegroundWindow() == target || Environment.TickCount64 >= focusDeadline)
+        { focusTarget = 0; return; }
+        foregroundSyncBlockedUntil = Math.Max(foregroundSyncBlockedUntil, Environment.TickCount64 + 400);
+        focusTimer.Start();
     }
 
     private void RestoreFocus()
@@ -938,7 +989,7 @@ internal sealed class WindowManagerContext : ApplicationContext, IInputHost
     {
         if (stopping) return;
         stopping = true;
-        maintenance.Stop(); hover.Stop(); layoutTimer.Stop();
+        maintenance.Stop(); hover.Stop(); layoutTimer.Stop(); focusTimer.Stop(); focusTarget = 0;
         input.Dispose();
         foreach (nint hook in eventHooks) Native.UnhookWinEvent(hook);
         eventHooks.Clear();
@@ -978,6 +1029,7 @@ internal sealed class WindowManagerContext : ApplicationContext, IInputHost
             Stop();
             SystemEvents.DisplaySettingsChanged -= DisplayChanged;
             SystemEvents.UserPreferenceChanged -= PreferencesChanged;
+            focusTimer.Stop(); focusTimer.Dispose();
             maintenance.Dispose(); hover.Dispose(); layoutTimer.Dispose();
             desktop.Dispose(); tray.ContextMenuStrip?.Dispose(); tray.Dispose(); dispatcher.Dispose();
         }
